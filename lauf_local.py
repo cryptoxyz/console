@@ -54,6 +54,52 @@ UNIT_PATTERN = re.compile(r"(\d+[.,]?\d*)\s*(mm|cm|m)\b", re.IGNORECASE)
 LOG = logging.getLogger("lauf_local")
 
 
+def load_directory_config(config_path: Path = CONFIG_PATH) -> Optional[Tuple[Path, Path, Path]]:
+    """Return cached directories if they are valid."""
+
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        LOG.warning("Konfigurationsdatei %s konnte nicht gelesen werden: %s", config_path, exc)
+        return None
+
+    try:
+        delivery = Path(raw["lieferscheine"]).expanduser()
+        invoices = Path(raw["rechnungen"]).expanduser()
+        output = Path(raw["out"]).expanduser()
+    except KeyError as missing_key:
+        LOG.warning("Konfiguration unvollständig, Schlüssel fehlt: %s", missing_key)
+        return None
+
+    paths = (delivery, invoices, output)
+    missing_dirs = [path for path in paths if not path.is_dir()]
+    if missing_dirs:
+        LOG.warning("Konfigurationsordner fehlen: %s", ", ".join(str(path) for path in missing_dirs))
+        return None
+
+    return paths
+
+
+
+def save_directory_config(delivery: Path, invoices: Path, output: Path, config_path: Path = CONFIG_PATH) -> None:
+    """Persist directory configuration for reuse."""
+
+    payload = {
+        "lieferscheine": str(delivery),
+        "rechnungen": str(invoices),
+        "out": str(output),
+    }
+    try:
+        config_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        LOG.warning("Konfiguration konnte nicht gespeichert werden: %s", exc)
+
+
 def configure_logging(verbose: bool = False) -> None:
     """Initialise a simple logging configuration."""
 
@@ -631,44 +677,51 @@ def export_to_csv(connection: sqlite3.Connection, output_file: Path) -> None:
 def pick_directories_via_gui() -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
     """Let the user pick directories for delivery notes, invoices and output."""
 
+    cached = load_directory_config()
+    if cached:
+        LOG.info("Verwende gespeicherte Verzeichnisse aus %s", CONFIG_PATH)
+        return cached
+
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    root = tk.Tk()
-    root.withdraw()
-
-    previous = {}
+    previous: Dict[str, str] = {}
     if CONFIG_PATH.exists():
         try:
             previous = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
-            previous = {}
+            LOG.debug("Bestehende Konfiguration konnte nicht gelesen werden.", exc_info=True)
+
+    root = tk.Tk()
+    root.withdraw()
 
     messagebox.showinfo("Verzeichnisse wählen", "Wähle den Ordner mit LIEFERSCHEINEN.")
     delivery = filedialog.askdirectory(initialdir=previous.get("lieferscheine"))
     if not delivery:
+        root.destroy()
         return None, None, None
 
     messagebox.showinfo("Verzeichnisse wählen", "Wähle den Ordner mit RECHNUNGEN.")
     invoices = filedialog.askdirectory(initialdir=previous.get("rechnungen"))
     if not invoices:
+        root.destroy()
         return None, None, None
 
     messagebox.showinfo("Verzeichnisse wählen", "Wähle den AUSGABE-Ordner.")
     output = filedialog.askdirectory(initialdir=previous.get("out"))
     if not output:
+        root.destroy()
         return None, None, None
 
-    CONFIG_PATH.write_text(
-        json.dumps(
-            {"lieferscheine": delivery, "rechnungen": invoices, "out": output},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    root.destroy()
 
-    return Path(delivery), Path(invoices), Path(output)
+    delivery_path = Path(delivery)
+    invoices_path = Path(invoices)
+    output_path = Path(output)
+    save_directory_config(delivery_path, invoices_path, output_path)
+
+    return delivery_path, invoices_path, output_path
+
 
 
 # ---------------------------------------------------------------------------
