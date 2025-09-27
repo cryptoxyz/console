@@ -429,6 +429,27 @@ def extract_ocr_texts(reader: PdfReader) -> List[str]:
     return texts
 
 
+
+def merge_page_texts(primary: Sequence[str], secondary: Sequence[str]) -> List[str]:
+    """Merge two per-page text sources while preserving page order."""
+
+    max_len = max(len(primary), len(secondary))
+    if max_len == 0:
+        return []
+
+    merged: List[str] = []
+    for index in range(max_len):
+        parts: List[str] = []
+        if index < len(primary) and primary[index]:
+            parts.append(primary[index])
+        if index < len(secondary) and secondary[index]:
+            parts.append(secondary[index])
+        merged.append("\n".join(parts))
+    return merged
+
+
+
+
 def assign_notes_to_positions(
     positions: Sequence[Position],
     page_texts: Sequence[str],
@@ -469,6 +490,7 @@ def assign_notes_to_positions(
 
 
 
+
 def import_lieferscheine(
     source: Path,
     connection: sqlite3.Connection,
@@ -503,15 +525,10 @@ def import_lieferscheine(
             LOG.warning("PyPDF2 konnte %s nicht oeffnen", pdf_path, exc_info=True)
 
         ocr_texts: List[str] = []
-        page_texts: List[str] = []
-
         if enable_ocr and reader is not None:
             ocr_texts = extract_ocr_texts(reader)
-            if any(text.strip() for text in ocr_texts):
-                page_texts = ocr_texts
 
-        if not page_texts:
-            page_texts = pdf_text_per_page(pdf_path)
+        page_texts = pdf_text_per_page(pdf_path)
 
         if not page_texts:
             try:
@@ -522,15 +539,16 @@ def import_lieferscheine(
             if fallback_text:
                 page_texts = [fallback_text]
 
+        if ocr_texts:
+            page_texts = merge_page_texts(page_texts, ocr_texts)
+
         if not page_texts:
             LOG.warning("Keine Textinformation in Lieferschein %s gefunden", pdf_path)
             continue
 
-        used_ocr_pages = page_texts is ocr_texts
-
         positions = extract_positions_from_text(page_texts)
 
-        if not positions and enable_ocr and ocr_texts and not used_ocr_pages:
+        if not positions and ocr_texts:
             positions = extract_positions_from_text(ocr_texts)
 
         if not positions:
@@ -559,6 +577,7 @@ def import_lieferscheine(
             insert_position(connection, row)
 
         connection.commit()
+
 
 
 def assign_invoice_to_positions(
@@ -636,6 +655,7 @@ def assign_invoice_to_positions(
 
 
 
+
 def import_rechnungen(
     source: Path,
     connection: sqlite3.Connection,
@@ -652,7 +672,7 @@ def import_rechnungen(
         enable_ocr = False
 
     for pdf_path in sorted(source.glob("*.pdf")):
-        text_content = ""
+        text_sources: List[str] = []
 
         if enable_ocr:
             reader: Optional[PdfReader] = None
@@ -662,14 +682,20 @@ def import_rechnungen(
                 LOG.warning("PyPDF2 konnte %s nicht oeffnen", pdf_path, exc_info=True)
             if reader is not None:
                 ocr_texts = extract_ocr_texts(reader)
-                text_content = "\n".join(t for t in ocr_texts if t).strip()
+                ocr_blob = "\n".join(t for t in ocr_texts if t).strip()
+                if ocr_blob:
+                    text_sources.append(ocr_blob)
 
-        if not text_content:
-            try:
-                text_content = extract_text(str(pdf_path)) or ""
-            except Exception:
-                LOG.warning("Konnte Rechnung %s nicht lesen", pdf_path, exc_info=True)
-                continue
+        try:
+            extracted = extract_text(str(pdf_path)) or ""
+        except Exception:
+            LOG.warning("Konnte Rechnung %s nicht lesen", pdf_path, exc_info=True)
+            extracted = ""
+        if extracted:
+            text_sources.append(extracted)
+
+        text_content = "\n\n".join(text_sources).strip()
+
 
         if not text_content:
             LOG.warning("Rechnung %s enthaelt keinen verwertbaren Text", pdf_path)
@@ -677,6 +703,7 @@ def import_rechnungen(
 
         info = parse_invoice(text_content)
         assign_invoice_to_positions(connection, info, pdf_path)
+
 
 
 def export_to_csv(connection: sqlite3.Connection, output_file: Path) -> None:
