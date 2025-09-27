@@ -409,17 +409,14 @@ def pdf_text_per_page(path: Path) -> List[str]:
     return texts
 
 
-def detect_handwritten_notes(reader: PdfReader, ocr_enabled: bool) -> List[str]:
-    """Return per-page OCR text extracted from *reader*."""
 
-    texts: List[str] = []
-    if not ocr_enabled:
-        return texts
+def extract_ocr_texts(reader: PdfReader) -> List[str]:
+    """Return OCR-derived text per page for *reader*."""
 
     if not OCR_AVAILABLE:
-        LOG.warning("OCR wurde angefordert, aber pytesseract ist nicht verfügbar.")
-        return texts
+        return []
 
+    texts: List[str] = []
     for page_index in range(len(reader.pages)):
         image = pdf_page_to_image(reader, page_index)
         if not image:
@@ -471,6 +468,7 @@ def assign_notes_to_positions(
     return notes
 
 
+
 def import_lieferscheine(
     source: Path,
     connection: sqlite3.Connection,
@@ -482,40 +480,57 @@ def import_lieferscheine(
         LOG.warning("Lieferschein-Ordner existiert nicht: %s", source)
         return
 
+    if enable_ocr and not OCR_AVAILABLE:
+        LOG.warning("OCR wurde angefordert, aber pytesseract ist nicht verfuegbar.")
+        enable_ocr = False
+
     for pdf_path in sorted(source.glob("*.pdf")):
         checksum = sha256_file(pdf_path)
         cursor = connection.execute(
-            "SELECT 1 FROM positionen WHERE quelle_pdf_sha256 = ? LIMIT 1", (checksum,)
+            "SELECT 1 FROM positionen WHERE quelle_pdf_sha256 = ? LIMIT 1",
+            (checksum,),
         )
         if cursor.fetchone():
-            LOG.info("Überspringe bereits importierten Lieferschein: %s", pdf_path.name)
+            LOG.info("Ueberspringe bereits importierten Lieferschein: %s", pdf_path.name)
             continue
 
         LOG.info("Verarbeite Lieferschein: %s", pdf_path.name)
 
-        try:
-            full_text = extract_text(str(pdf_path)) or ""
-        except Exception:
-            LOG.warning("Konnte Text aus %s nicht extrahieren", pdf_path, exc_info=True)
-            full_text = ""
-
-        page_texts = pdf_text_per_page(pdf_path)
-        if not page_texts and full_text:
-            page_texts = [full_text]
-
+        reader: Optional[PdfReader] = None
         try:
             reader = PdfReader(str(pdf_path))
         except Exception:
-            LOG.warning("PyPDF2 konnte %s nicht öffnen", pdf_path, exc_info=True)
-            reader = None
+            LOG.warning("PyPDF2 konnte %s nicht oeffnen", pdf_path, exc_info=True)
 
         ocr_texts: List[str] = []
-        if reader is not None:
-            ocr_texts = detect_handwritten_notes(reader, enable_ocr)
+        page_texts: List[str] = []
+
+        if enable_ocr and reader is not None:
+            ocr_texts = extract_ocr_texts(reader)
+            if any(text.strip() for text in ocr_texts):
+                page_texts = ocr_texts
+
+        if not page_texts:
+            page_texts = pdf_text_per_page(pdf_path)
+
+        if not page_texts:
+            try:
+                fallback_text = extract_text(str(pdf_path)) or ""
+            except Exception:
+                LOG.warning("Konnte Text aus %s nicht extrahieren", pdf_path, exc_info=True)
+                fallback_text = ""
+            if fallback_text:
+                page_texts = [fallback_text]
+
+        if not page_texts:
+            LOG.warning("Keine Textinformation in Lieferschein %s gefunden", pdf_path)
+            continue
+
+        used_ocr_pages = page_texts is ocr_texts
 
         positions = extract_positions_from_text(page_texts)
 
-        if not positions and enable_ocr and ocr_texts:
+        if not positions and enable_ocr and ocr_texts and not used_ocr_pages:
             positions = extract_positions_from_text(ocr_texts)
 
         if not positions:
@@ -620,20 +635,47 @@ def assign_invoice_to_positions(
     connection.commit()
 
 
-def import_rechnungen(source: Path, connection: sqlite3.Connection) -> None:
+
+def import_rechnungen(
+    source: Path,
+    connection: sqlite3.Connection,
+    enable_ocr: bool,
+) -> None:
     """Import invoice metadata and attach it to existing positions."""
 
     if not source.exists():
         LOG.warning("Rechnungs-Ordner existiert nicht: %s", source)
         return
 
+    if enable_ocr and not OCR_AVAILABLE:
+        LOG.warning("OCR wurde angefordert, aber pytesseract ist nicht verfuegbar.")
+        enable_ocr = False
+
     for pdf_path in sorted(source.glob("*.pdf")):
-        try:
-            text = extract_text(str(pdf_path)) or ""
-        except Exception:
-            LOG.warning("Konnte Rechnung %s nicht lesen", pdf_path, exc_info=True)
+        text_content = ""
+
+        if enable_ocr:
+            reader: Optional[PdfReader] = None
+            try:
+                reader = PdfReader(str(pdf_path))
+            except Exception:
+                LOG.warning("PyPDF2 konnte %s nicht oeffnen", pdf_path, exc_info=True)
+            if reader is not None:
+                ocr_texts = extract_ocr_texts(reader)
+                text_content = "\n".join(t for t in ocr_texts if t).strip()
+
+        if not text_content:
+            try:
+                text_content = extract_text(str(pdf_path)) or ""
+            except Exception:
+                LOG.warning("Konnte Rechnung %s nicht lesen", pdf_path, exc_info=True)
+                continue
+
+        if not text_content:
+            LOG.warning("Rechnung %s enthaelt keinen verwertbaren Text", pdf_path)
             continue
-        info = parse_invoice(text)
+
+        info = parse_invoice(text_content)
         assign_invoice_to_positions(connection, info, pdf_path)
 
 
@@ -737,7 +779,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rechnungen", type=Path, help="Ordner mit Rechnungs-PDFs")
     parser.add_argument("--outdir", type=Path, default=Path("./out"), help="Ausgabe-Ordner")
     parser.add_argument("--db", choices=["sqlite", "csv"], default="sqlite")
-    parser.add_argument("--ocr", action="store_true", help="OCR für handschriftliche Ergänzungen aktivieren")
+    parser.add_argument("--ocr", action="store_true", help="OCR fuer gescannte PDFs aktivieren")
     parser.add_argument("--gui", action="store_true", help="Verzeichnisse per Dialog wählen")
     parser.add_argument("--verbose", action="store_true", help="Ausführliche Log-Ausgabe aktivieren")
     return parser.parse_args(argv)
@@ -766,7 +808,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     connection = ensure_db(db_path)
 
     import_lieferscheine(args.lieferscheine, connection, args.ocr)
-    import_rechnungen(args.rechnungen, connection)
+    import_rechnungen(args.rechnungen, connection, args.ocr)
 
     if args.db == "csv":
         export_to_csv(connection, args.outdir / "positionen.csv")
