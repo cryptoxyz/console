@@ -1,0 +1,22 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.coverage
+
+# Application output
+out/
+logs/

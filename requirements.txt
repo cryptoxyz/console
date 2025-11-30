@@ -1,0 +1,7 @@
+pdfminer.six
+PyPDF2
+Pillow
+pytesseract
+opencv-python-headless; platform_python_implementation == "CPython"
+pdf417gen
+reportlab
